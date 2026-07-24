@@ -1,0 +1,718 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ─── PLAN LIMITS ─────────────────────────────────────────────────────────────
+
+model PlanLimit {
+  id               String  @id @default(cuid())
+  plan             Plan    @unique
+  maxDevices       Int     @default(1)
+  monthlyMessages  Int     @default(1000)   // -1 = unlimited
+  maxContacts      Int     @default(500)    // -1 = unlimited
+  maxBroadcasts    Int     @default(5)      // per month
+  messageRetentionDays Int @default(2)      // days to keep messages, -1 = forever
+  maxTemplates     Int     @default(5)      // -1 = unlimited
+  canAutoReply     Boolean @default(false)
+  canDeviceRotation Boolean @default(false)
+  canSchedule      Boolean @default(true)
+  canWebhook       Boolean @default(false)
+  canCsvImport     Boolean @default(false)
+  canIpWhitelist   Boolean @default(false)
+  canAiReply       Boolean @default(false)
+  aiMonthlyReplies Int     @default(0)      // kuota balasan AI per bulan; 0 = tidak ada, -1 = unlimited
+  price            Int     @default(0)      // harga bulanan dalam IDR sen (Rp 66.000 = 6600000)
+  hasWatermark     Boolean @default(false)  // pesan keluar diberi watermark Blastify
+  allowedMessageTypes String[] @default([]) // tipe pesan yang boleh dikirim; kosong = semua tipe
+  allowedPlatforms String[] @default([])    // key integrasi yang boleh dipakai (lihat platforms.ts); kosong = semua (bila canWebhook true)
+}
+
+// ─── USER ─────────────────────────────────────────────────────────────────────
+
+model User {
+  id              String    @id @default(cuid())
+  email           String    @unique
+  password        String
+  name            String
+  plan            Plan      @default(FREE)
+  apiKey          String    @unique @default(cuid())
+  isActive        Boolean   @default(true)
+  emailVerifiedAt DateTime?
+  totpSecret      String?   // base32 TOTP secret (2FA); terisi saat setup
+  totpEnabledAt   DateTime? // null = 2FA belum aktif
+  planExpiresAt   DateTime?
+  planActivatedAt DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  devices             Device[]
+  messages            Message[]
+  webhooks            Webhook[]
+  tokens              RefreshToken[]
+  passwordResetTokens PasswordResetToken[]
+  emailVerificationTokens EmailVerificationToken[]
+  contacts            Contact[]
+  contactGroups       ContactGroup[]
+  contactLabels       ContactLabel[]
+  autoReplies         AutoReply[]
+  broadcasts          Broadcast[]
+  invoices            Invoice[]
+  deviceAgents        DeviceAgent[]
+  integrations        Integration[]
+  incomingMessages    IncomingMessage[]
+  messageTemplates    MessageTemplate[]
+  ipWhitelists        IpWhitelist[]
+  aiUsageCounters     AiUsageCounter[]
+  chatFlows           ChatFlow[]
+  emailTemplates      EmailTemplate[]
+}
+
+enum Plan {
+  FREE
+  LITE
+  REGULAR
+  MASTER
+  ULTRA
+}
+
+model RefreshToken {
+  id        String   @id @default(cuid())
+  userId    String
+  token     String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model PasswordResetToken {
+  id        String   @id @default(cuid())
+  userId    String
+  token     String   @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model EmailVerificationToken {
+  id        String    @id @default(cuid())
+  userId    String
+  token     String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model Invoice {
+  id          String        @id @default(cuid())
+  userId      String
+  plan        Plan
+  amount      Int           // dalam IDR (sen)
+  status      InvoiceStatus @default(PENDING)
+  paymentUrl  String?
+  paymentMethod String?     // dari Midtrans: gopay | bank_transfer | qris | ...
+  paidAt      DateTime?
+  expiresAt   DateTime?
+  notes       String?
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+enum InvoiceStatus {
+  PENDING
+  PAID
+  EXPIRED
+  CANCELLED
+}
+
+// ─── DEVICE ───────────────────────────────────────────────────────────────────
+
+model Device {
+  id          String       @id @default(cuid())
+  userId      String
+  name        String
+  phone       String?
+  status      DeviceStatus @default(DISCONNECTED)
+  qrCode      String?
+  sessionData String?      @db.Text
+  webhookId   String?
+
+  // Anti-ban: random delay between sends (milliseconds)
+  minDelay    Int          @default(1000)
+  maxDelay    Int          @default(3000)
+
+  // Working hours (24h format, null = always active)
+  workingHoursStart Int?   // e.g. 8 = 08:00
+  workingHoursEnd   Int?   // e.g. 17 = 17:00
+  workingDays       Int[]  // 0=Sun,1=Mon,...,6=Sat; empty = all days
+
+  // Bad words filter
+  badWordsEnabled   Boolean  @default(false)
+  badWords          String[] // list of words to filter
+
+  // Lead rotator: index of next agent to receive incoming lead
+  rotatorIndex      Int      @default(0)
+
+  // Auto save contact from incoming messages
+  autoSaveContacts  Boolean  @default(false)
+
+  // Human behavior simulation (anti-ban)
+  typingIndicator        Boolean @default(false) // simulate composing before send
+  readReceiptSimulation  Boolean @default(false) // auto-read incoming messages with delay
+
+  // Warm-up schedule (anti-ban ramp-up for new numbers)
+  warmupEnabled   Boolean   @default(false)
+  warmupStartedAt DateTime? // set otomatis saat device pertama kali CONNECTED dengan warmupEnabled=true
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  user        User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  messages    Message[]
+  webhook     Webhook?      @relation(fields: [webhookId], references: [id])
+  autoReplies      AutoReply[]
+  agents           DeviceAgent[]
+  integrations     Integration[]
+  incomingMessages IncomingMessage[]
+  chatFlows        ChatFlow[]
+}
+
+enum DeviceStatus {
+  DISCONNECTED
+  CONNECTING
+  QR_READY
+  CONNECTED
+  BANNED
+  LOGGED_OUT
+}
+
+// ─── DEVICE AGENT (Multi-agent) ───────────────────────────────────────────────
+
+model DeviceAgent {
+  id          String          @id @default(cuid())
+  deviceId    String
+  userId      String          // the agent's user account
+  role        DeviceAgentRole @default(AGENT)
+  invitedBy   String          // userId of device owner who invited
+  isActive    Boolean         @default(true)
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+
+  device Device @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([deviceId, userId])
+  @@index([deviceId, isActive])
+}
+
+enum DeviceAgentRole {
+  OWNER
+  AGENT
+  VIEWER
+}
+
+// ─── MESSAGE ──────────────────────────────────────────────────────────────────
+
+model Message {
+  id           String        @id @default(cuid())
+  userId       String
+  deviceId     String
+  broadcastId  String?
+  to           String
+  type         MessageType   @default(TEXT)
+  content      String        @db.Text
+  mediaUrl     String?
+  caption      String?
+  status       MessageStatus @default(PENDING)
+  retries      Int           @default(0)
+  errorMessage String?
+  waMessageId  String?
+  variant      String?       // "A" | "B" — hanya terisi untuk broadcast A/B testing
+  scheduledAt  DateTime?
+  sentAt       DateTime?
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+
+  user      User       @relation(fields: [userId], references: [id])
+  device    Device     @relation(fields: [deviceId], references: [id])
+  broadcast Broadcast? @relation(fields: [broadcastId], references: [id])
+}
+
+enum MessageType {
+  TEXT
+  IMAGE
+  VIDEO
+  DOCUMENT
+  AUDIO
+  LOCATION
+  CONTACT
+  TEMPLATE
+  LIST      // WhatsApp interactive list message
+  BUTTON    // WhatsApp button message
+}
+
+enum MessageStatus {
+  PENDING
+  QUEUED
+  SENT
+  DELIVERED
+  READ
+  FAILED
+}
+
+// ─── WEBHOOK ──────────────────────────────────────────────────────────────────
+
+model Webhook {
+  id        String   @id @default(cuid())
+  userId    String
+  url       String
+  secret    String   @default(cuid())
+  isActive  Boolean  @default(true)
+  events    String[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user    User     @relation(fields: [userId], references: [id])
+  devices Device[]
+}
+
+// ─── CONTACT ──────────────────────────────────────────────────────────────────
+
+model Contact {
+  id        String   @id @default(cuid())
+  userId    String
+  name      String
+  phone     String
+  variables Json?    // { "city": "Jakarta", "code": "ABC" }
+  notes     String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user   User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  groups ContactGroupMember[]
+  labels ContactLabelMember[]
+
+  @@unique([userId, phone])
+}
+
+// ─── CONTACT LABELS ───────────────────────────────────────────────────────────
+
+model ContactLabel {
+  id        String   @id @default(cuid())
+  userId    String
+  name      String
+  color     String   @default("#6366f1")  // hex color for UI
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user     User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
+  contacts ContactLabelMember[]
+
+  @@unique([userId, name])
+}
+
+model ContactLabelMember {
+  contactId  String
+  labelId    String
+  assignedAt DateTime @default(now())
+
+  contact Contact      @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  label   ContactLabel @relation(fields: [labelId], references: [id], onDelete: Cascade)
+
+  @@id([contactId, labelId])
+}
+
+model ContactGroup {
+  id          String   @id @default(cuid())
+  userId      String
+  name        String
+  description String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  user    User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
+  members ContactGroupMember[]
+  broadcasts Broadcast[]
+}
+
+model ContactGroupMember {
+  contactId String
+  groupId   String
+  addedAt   DateTime @default(now())
+
+  contact Contact      @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  group   ContactGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+
+  @@id([contactId, groupId])
+}
+
+// ─── AUTO-REPLY / CHATBOT ─────────────────────────────────────────────────────
+
+model AutoReply {
+  id          String          @id @default(cuid())
+  userId      String
+  deviceId    String
+  name        String
+  keyword     String
+  matchType   KeywordMatchType @default(CONTAINS)
+  replyType   MessageType     @default(TEXT)
+  replyContent String         @db.Text
+  replyMediaUrl String?
+  isActive    Boolean         @default(true)
+  priority    Int             @default(0)
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  device Device @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
+  @@index([deviceId, isActive])
+}
+
+enum KeywordMatchType {
+  EXACT        // pesan harus persis sama
+  CONTAINS     // pesan mengandung kata kunci
+  STARTS_WITH  // pesan dimulai dengan kata kunci
+  REGEX        // regex pattern
+  AI           // balasan digenerate LLM — replyContent = system prompt, keyword opsional sebagai filter
+}
+
+// ─── CHAT FLOW (multi-step chatbot, backend engine — JSON-based, tanpa UI visual) ──
+
+model ChatFlow {
+  id          String   @id @default(cuid())
+  userId      String
+  deviceId    String
+  name        String
+  triggerKeyword   String
+  triggerMatchType KeywordMatchType @default(CONTAINS) // AI tidak dipakai di sini — hanya EXACT/CONTAINS/STARTS_WITH/REGEX
+  isActive    Boolean  @default(true)
+  startNodeId String
+  nodes       Json     // FlowNode[] — lihat src/services/chatflow.service.ts untuk shape
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  user     User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  device   Device            @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  sessions ChatFlowSession[]
+
+  @@index([deviceId, isActive])
+}
+
+model ChatFlowSession {
+  id                String   @id @default(cuid())
+  flowId            String
+  deviceId          String
+  contactPhone      String   // nomor lawan bicara (tanpa @s.whatsapp.net)
+  currentNodeId     String
+  variables         Json     @default("{}")
+  status            ChatFlowSessionStatus @default(ACTIVE)
+  lastInteractionAt DateTime @default(now())
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  flow ChatFlow @relation(fields: [flowId], references: [id], onDelete: Cascade)
+
+  // Satu kontak hanya bisa berada di satu percakapan flow aktif per device —
+  // record di-upsert (reset) saat flow baru dimulai untuk kontak yang sama.
+  @@unique([deviceId, contactPhone])
+  @@index([flowId])
+}
+
+enum ChatFlowSessionStatus {
+  ACTIVE
+  COMPLETED
+  EXPIRED
+}
+
+// ─── BROADCAST ────────────────────────────────────────────────────────────────
+
+model Broadcast {
+  id            String          @id @default(cuid())
+  userId        String
+  name          String
+  deviceId      String?         // null = gunakan device rotation
+  contactGroupId String?
+  type          MessageType     @default(TEXT)
+  content       String          @db.Text
+  mediaUrl      String?
+  caption       String?
+
+  // A/B testing — bila variantBRatio > 0, sebagian penerima (acak) menerima varian B
+  variantBContent  String?      @db.Text
+  variantBMediaUrl String?
+  variantBCaption  String?
+  variantBRatio    Int          @default(0) // 0-100, persentase penerima yang dapat varian B
+
+  status        BroadcastStatus @default(DRAFT)
+  scheduledAt   DateTime?
+  startedAt     DateTime?
+  finishedAt    DateTime?
+  totalCount    Int             @default(0)
+  sentCount     Int             @default(0)
+  failedCount   Int             @default(0)
+  delayMin      Int             @default(1000)  // ms
+  delayMax      Int             @default(3000)  // ms
+  createdAt     DateTime        @default(now())
+  updatedAt     DateTime        @updatedAt
+
+  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  contactGroup ContactGroup? @relation(fields: [contactGroupId], references: [id])
+  messages     Message[]
+}
+
+enum BroadcastStatus {
+  DRAFT
+  QUEUED
+  RUNNING
+  PAUSED
+  FINISHED
+  FAILED
+}
+
+// ─── WEBHOOK INTEGRATIONS ─────────────────────────────────────────────────────
+
+model Integration {
+  id              String   @id @default(cuid())
+  userId          String
+  deviceId        String
+  name            String
+  platform        String   @default("generic")  // shopify | woocommerce | jotform | generic | …
+  secretToken     String   @unique @default(cuid())
+  isActive        Boolean  @default(true)
+
+  // Where to get the recipient phone from the incoming payload
+  phoneField      String?  // dot-path, e.g. "customer.phone"
+  targetPhone     String?  // fixed phone number — overrides phoneField
+
+  // Message template with {{dot.notation}} support
+  messageTemplate String   @db.Text
+
+  // Optional event filter — only process if payload[filterField] == filterValue
+  filterField     String?  // e.g. "event" or "topic"
+  filterValue     String?  // e.g. "orders/create"
+
+  // Optional inbound signature verification (HMAC-SHA256 of raw body)
+  signatureHeader String?  // e.g. "x-shopify-hmac-sha256" / "x-wc-webhook-signature"
+  signatureSecret String?  // shared secret dari platform; null = tanpa verifikasi
+
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  device Device @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  logs   IntegrationLog[]
+
+  @@index([userId])
+}
+
+model IntegrationLog {
+  id              String   @id @default(cuid())
+  integrationId   String
+  rawPayload      Json
+  renderedMessage String?  @db.Text
+  phoneSent       String?
+  status          String   // SUCCESS | FAILED | FILTERED | INVALID_PHONE | INACTIVE
+  error           String?
+  createdAt       DateTime @default(now())
+
+  integration Integration @relation(fields: [integrationId], references: [id], onDelete: Cascade)
+
+  @@index([integrationId, createdAt])
+}
+
+enum IntegrationLogStatus {
+  SUCCESS
+  FAILED
+  FILTERED
+  INVALID_PHONE
+  INACTIVE
+}
+
+// ─── INCOMING MESSAGES (inbox) ────────────────────────────────────────────────
+
+model IncomingMessage {
+  id          String   @id @default(cuid())
+  userId      String
+  deviceId    String
+  from        String   // nomor pengirim (628xxx)
+  pushName    String?
+  type        String   @default("text") // text | image | video | document | audio | sticker
+  content     String   @db.Text
+  mediaUrl    String?
+  isRead      Boolean  @default(false)
+  waMessageId String?  @unique
+  repliedWith String?  // isi balasan auto-reply jika ada
+  isGroup     Boolean  @default(false)
+  groupId     String?  // JID grup jika isGroup = true
+  createdAt   DateTime @default(now())
+
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  device Device @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
+  @@index([userId, deviceId, createdAt(sort: Desc)])
+  @@index([userId, from])
+}
+
+// ─── MESSAGE TEMPLATES ────────────────────────────────────────────────────────
+
+model MessageTemplate {
+  id         String      @id @default(cuid())
+  userId     String
+  name       String
+  category   String      @default("general") // general | greeting | promo | notification
+  type       MessageType @default(TEXT)
+  content    String      @db.Text
+  mediaUrl   String?
+  caption    String?
+  isActive   Boolean     @default(true)
+  usageCount Int         @default(0)
+  createdAt  DateTime    @default(now())
+  updatedAt  DateTime    @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, category])
+}
+
+// ─── IP WHITELIST ─────────────────────────────────────────────────────────────
+
+model IpWhitelist {
+  id        String   @id @default(cuid())
+  userId    String
+  ip        String   // CIDR or exact IP, e.g. "203.0.113.0/24" or "203.0.113.5"
+  label     String?
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, ip])
+}
+
+// ─── AI USAGE METERING ────────────────────────────────────────────────────────
+
+model AiUsageCounter {
+  id        String   @id @default(cuid())
+  userId    String
+  month     String   // "YYYY-MM"
+  count     Int      @default(0)
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, month])
+}
+
+// ─── ADMIN PANEL ──────────────────────────────────────────────────────────────
+
+model Admin {
+  id        String    @id @default(cuid())
+  email     String    @unique
+  password  String
+  name      String
+  role      AdminRole @default(STAFF)
+  isActive  Boolean   @default(true)
+  lastLogin DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+}
+
+enum AdminRole {
+  SUPER_ADMIN
+  ADMIN
+  STAFF
+}
+
+// ─── AUDIT LOG ────────────────────────────────────────────────────────────────
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  actorType  String   // "user" | "admin"
+  actorId    String
+  actorEmail String
+  action     String   // "invoice.confirmed" | "user.plan_changed" | …
+  targetType String?
+  targetId   String?
+  metadata   Json?
+  ip         String?
+  createdAt  DateTime @default(now())
+
+  @@index([actorId, createdAt(sort: Desc)])
+  @@index([action, createdAt(sort: Desc)])
+}
+
+// ─── EMAIL TEMPLATES ──────────────────────────────────────────────────────────
+
+model EmailTemplate {
+  id                 String    @id @default(cuid())
+  userId             String?   // null = system default template (managed via /admin)
+  name               String
+  slug               String    // e.g. "welcome", "password-reset"
+  category           String    @default("notification") // registration | account | payment | notification
+  subject            String
+  htmlContent        String    @db.Text
+  plainTextContent   String?   @db.Text
+  variables          Json      @default("[]") // e.g. ["name", "email", "resetLink"]
+  isDefault          Boolean   @default(false) // true for system-seeded templates (userId = null)
+  isActive           Boolean   @default(true)
+  version            Int       @default(1)
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+  deletedAt          DateTime?
+
+  user     User?                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  versions EmailTemplateVersion[]
+
+  @@unique([userId, slug])
+  @@index([slug])
+  @@index([category])
+}
+
+model EmailTemplateVersion {
+  id          String   @id @default(cuid())
+  templateId  String
+  version     Int
+  subject     String
+  htmlContent String   @db.Text
+  createdAt   DateTime @default(now())
+  createdBy   String?  // userId or adminId
+
+  template EmailTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+
+  @@index([templateId, version])
+}
+
+// ─── ANNOUNCEMENTS ────────────────────────────────────────────────────────────
+
+model Announcement {
+  id         String           @id @default(cuid())
+  title      String
+  content    String           @db.Text
+  type       AnnouncementType @default(INFO)
+  isActive   Boolean          @default(true)
+  startsAt   DateTime?
+  endsAt     DateTime?
+  targetPlan Plan[]           // empty = all plans
+  createdBy  String           // adminId
+  createdAt  DateTime         @default(now())
+  updatedAt  DateTime         @updatedAt
+}
+
+enum AnnouncementType {
+  INFO
+  WARNING
+  DANGER
+  SUCCESS
+  MAINTENANCE
+}
